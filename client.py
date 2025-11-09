@@ -37,7 +37,8 @@ MIN_OFF_SEC = 90                # compressor min OFF
 os.system("modprobe w1-gpio")
 os.system("modprobe w1-therm")
 W1_BASE = "/sys/bus/w1/devices"
-port = serial.Serial('/dev/ttyS0', baudrate=9600, timeout=3)
+# Ohaus - 19200 - Elicom - 9600
+port = serial.Serial('/dev/ttyS0', baudrate=19200, timeout=3)
 i2c = board.I2C()
 ads = ADS1015(i2c)
 
@@ -54,7 +55,6 @@ def _find_ds18b20_device_files():
     return None
 
 DS18B20_FILES = _find_ds18b20_device_files()
-print(DS18B20_FILES)
 dht22 = adafruit_dht.DHT22(board.D4, use_pulseio=False)
 
 # === Helpers ===
@@ -79,10 +79,10 @@ def load_state():
     return state
 
 def read_scale():
+    port.reset_input_buffer()
     raw = port.read_until(b'\x03')
     if not raw:
         return None
-
     message = raw.decode('ascii', errors='ignore').strip()
     match = re.search(r'W= ([-+]?[0-9]*\.?[0-9]+)\s*kg', message)
     if not match:
@@ -312,7 +312,7 @@ def main():
     try:
         while True:
             now_mono = time.monotonic()
-            w = read_scale_ohaus()
+            w = read_scale()
             if now_mono - last_measurements_read > SENSOR_READ_INTERVAL:
                 temp_outside, hum, temp_inside, v = read_measurements()
                 last_measurements_read = now_mono
@@ -337,7 +337,6 @@ def main():
             if control_mode == "auto":
                 if first_connection == False:
                     ts, tf = get_config()
-                    print(ts, tf)
                 else:
                     ts = current_state["config"]["temp_start_compressor"]
                     tf = current_state["config"]["temp_stop_compressor"]
@@ -357,7 +356,6 @@ def main():
             if (now_mono - last_save) >= SAVE_STATE_INTERVAL:
                 save_state(current_state)
                 last_save = now_mono
-            print(temp_inside, hum, temp_outside, v, w)
 
     except KeyboardInterrupt:
         print("Exiting...")
