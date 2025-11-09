@@ -29,9 +29,9 @@ SENSOR_READ_INTERVAL = 2        # s
 UPLOAD_INTERVAL = 5            # s
 CHECK_POLL_INTERVAL = 4         # s
 SAVE_STATE_INTERVAL = 120       # s
-MANUAL_ROUTE_BACKOFF = 5        # s
-MIN_ON_SEC = 120                # compressor min ON
-MIN_OFF_SEC = 90                # compressor min OFF
+MANUAL_ROUTE_BACKOFF = 3        # s
+MIN_ON_SEC = 1                # compressor min ON
+MIN_OFF_SEC = 9                # compressor min OFF
 
 # === Sensor setup (absolute paths) ===
 os.system("modprobe w1-gpio")
@@ -153,7 +153,7 @@ def read_measurements():
 
 def send_measurements(temp_inside, humidity, temp_outside, v, w):
     try:
-        if (temp_inside is not None) and (humidity is not None) and (temp_outside is not None) and (v is not None) and (w is not None):
+        if (temp_inside is not None) and (humidity is not None) and (temp_outside is not None):
             data = {"temp_inside": temp_inside, "humidity": humidity, "temp_outside": temp_outside, "voltage": v, "weight": w}
             r = requests.post(API_SENSOR_URL, json=data, timeout=5)
             print("Sensor data sent:", r.status_code)
@@ -281,7 +281,7 @@ def measure_rms(sample_time=1.0):
 
     # Undo voltage divider (2:1)
     vrms_module = vrms_adc * 2.0
-    
+
     # Constant for calibration
     K = 757
 
@@ -319,8 +319,7 @@ def main():
 
             # One-time config push on first (re)connection with backoff
             if first_connection and (now_mono - last_handshake_try) >= MANUAL_ROUTE_BACKOFF:
-                if post_config_once():
-                    post_relay_states()
+                if post_relay_states():
                     first_connection = False
                 last_handshake_try = now_mono
 
@@ -337,6 +336,7 @@ def main():
             if control_mode == "auto":
                 if first_connection == False:
                     ts, tf = get_config()
+                    print(ts, tf)
                 else:
                     ts = current_state["config"]["temp_start_compressor"]
                     tf = current_state["config"]["temp_stop_compressor"]
