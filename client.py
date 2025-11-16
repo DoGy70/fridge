@@ -17,11 +17,15 @@ API_RELAY_URL  = "http://192.168.0.230:5050/api/relay-state"
 API_MODE_URL   = "http://192.168.0.230:5050/api/mode"
 API_CONFIG_URL = "http://192.168.0.230:5050/api/config"
 STATE_FILE = "system_state.json"
-RELAY_PINS = {"relay1": 26, "relay2": 20, "relay3": 21}
+RELAY_PINS = {"compressor": 26, "ventilation": 20, "heater": 21}
 current_state = {
-    "mode": "auto",
-    "relay_states": {"relay1": 0, "relay2": 0, "relay3": 0},
-    "config": {"temp_start_compressor": 4.5, "temp_stop_compressor": 3.5}
+    "auto_mode": True,
+    "relay_states": {"compressor": 0, "ventilation": 0, "heater": 0},
+    "target_temperature": 0,
+    "defrost_threshold_temperature": 25,
+    "status": "OFF",
+    "defrost_type": "AUTO",
+    "problem": False
 }
 
 # Intervals
@@ -37,10 +41,17 @@ MIN_OFF_SEC = 9                # compressor min OFF
 os.system("modprobe w1-gpio")
 os.system("modprobe w1-therm")
 W1_BASE = "/sys/bus/w1/devices"
-# Ohaus - 19200 - Elicom - 9600
-port = serial.Serial('/dev/ttyS0', baudrate=19200, timeout=3)
+
+# Default values
+id = 1
+hysteresis_defrost = 2
+hysteresis_compressor_stop = 3
 i2c = board.I2C()
 ads = ADS1015(i2c)
+_last_state_compressor = 0
+_last_change_compressor = 0
+_last_state_defrost = 0
+_last_change_defrost = 0
 
 def _find_ds18b20_device_files():
     ds18b20_files = []
@@ -78,35 +89,6 @@ def load_state():
     print(f"Restored state from {time.ctime(state['timestamp'])}")
     return state
 
-def read_scale():
-    port.reset_input_buffer()
-    raw = port.read_until(b'\x03')
-    if not raw:
-        return None
-    message = raw.decode('ascii', errors='ignore').strip()
-    match = re.search(r'W= ([-+]?[0-9]*\.?[0-9]+)\s*kg', message)
-    if not match:
-        return None
-
-    weight = float(match.group(1))
-    return weight
-
-def read_scale_ohaus():
-    port.write(b'P\r\n')
-    time.sleep(0.5)
-    raw = port.read_all()
-    if not raw:
-        return None
-
-    message = raw.decode('ascii', errors='ignore').strip()
-    match = re.search(r"[-+]?\d*\.\d+|\d+", message)
-  
-    if not match:
-        return None
-    print(match.group())
-    weight = float(match.group())
-    return weight
-
 def read_temp_raw():
     lines = []
     if not DS18B20_FILES:
@@ -120,45 +102,81 @@ def read_temp_raw():
 
 def read_temp_ds18b20():
     files_lines = read_temp_raw()
+
+    if not files_lines:
+        return [None, None]
+
     temps = []
-
-    if files_lines is None:
-        return None
-
-    tries = 0
     for lines in files_lines:
+        tries = 0
         while lines[0].strip().endswith("YES") is False and tries < 5:
             time.sleep(0.2)
             lines = read_temp_raw()
+            if not lines:
+                return [None, None]
             tries += 1
-            if lines is None:
-                return None
+
         equals_pos = lines[1].find("t=")
         if equals_pos != -1:
             temp_string = lines[1][equals_pos + 2:]
             temps.append(float(temp_string) / 1000.0)
+        else:
+            temps.append(None)
 
-    return [None, None] if temps is None else temps
+    if len(temps) < 2:
+        temps += [None] * (2 - len(temps))
+
+    return temps
 
 def read_measurements():
     try:
-        h = dht22.humidity
+        humidity = dht22.humidity
     except RuntimeError as err:
         print(f"DHT22 read error: {err.args[0]}")
-        h =  None
-    temp_inside = read_temp_ds18b20()[0]
-    temp_outside = read_temp_ds18b20()[1]
-    v = measure_rms()
-    return temp_inside, h, temp_outside, v
+        humidity =  None
+    temperatures = read_temp_ds18b20()
+    temperature = temperatures[0]
+    evaporator_temperature = temperatures[1]
+    supply_voltage = measure_rms()
+    return temperature, humidity, evaporator_temperature, supply_voltage
 
-def send_measurements(temp_inside, humidity, temp_outside, v, w):
-    try:
-        if (temp_inside is not None) and (humidity is not None) and (temp_outside is not None):
-            data = {"temp_inside": temp_inside, "humidity": humidity, "temp_outside": temp_outside, "voltage": v, "weight": w}
-            r = requests.post(API_SENSOR_URL, json=data, timeout=5)
-            print("Sensor data sent:", r.status_code)
-    except requests.RequestException as e:
-        print("Error contacting server:", e)
+def send_measurements(temperature, humidity, evaporator_temperature, supply_voltage):
+        payload = {
+        "id": id,
+        "temperature": temperature,
+        "humidity": humidity,
+        "temperature_evaporator": evaporator_temperature,
+        "supply_voltage": supply_voltage,
+        "target_temperature": current_state.get("target_temperature"),
+        "defrost_threshold_temperature": current_state.get("defrost_threshold_temperature"),
+        "defrost_type": current_state.get("defrost_type"),
+        "compressor_on": current_state["relay_states"].get("compressor") == 1,
+        "ventilation_on": current_state["relay_states"].get("ventilation") == 1,
+        "heater_on": current_state["relay_states"].get("heater") == 1,
+        "auto_mode": current_state.get("auto_mode"),
+        "status": current_state.get("status"),
+        "problem": current_state.get("problem"),
+        }
+        try:
+            response = requests.post(API_SENSOR_URL, json=payload, timeout=5)
+            response.raise_for_status()
+            r = response.json()
+            current_state.update({
+                "auto_mode": r.get("auto_mode", current_state["auto_mode"]),
+                "target_temperature": r.get("target_temperature", current_state["target_temperature"]),
+                "defrost_type": r.get("defrost_type", current_state["defrost_type"]),
+                "defrost_threshold_temperature": r.get("defrost_threshold_temperature", current_state["defrost_threshold_temperature"])
+            })
+            if not current_state["auto_mode"]:
+                relays = current_state["relay_states"]
+                relays["compressor"] = 1 if r.get("compressor_on") == True else 0
+                relays["ventilation"] = 1 if r.get("ventilation_on") == True else 0
+                relays["heater"] = 1 if r.get("heater_on") == True else 0
+
+            return 0
+        except requests.RequestException as e:
+            print("Error contacting server:", e)
+            return 1
 
 def setup_gpio():
     GPIO.setwarnings(False)
@@ -168,94 +186,64 @@ def setup_gpio():
         GPIO.output(pin, GPIO.HIGH)  # default off (active-low)
 
 def set_relay_states(states):
-    global _last_state
-
+    global _last_state_compressor, _last_change_compressor
     for relay, value in states.items():
         if relay not in RELAY_PINS:
             continue
 
-        if relay == 'relay1':
-            _last_state = value
+        if relay == 'compressor':
+            if value != _last_state_compressor:
+                _last_state_compressor = value
+                _last_change_compressor = _now_ms()
 
         GPIO.output(RELAY_PINS[relay], GPIO.LOW if value == 1 else GPIO.HIGH)
         current_state["relay_states"][relay] = 1 if value == 1 else 0
 
-def fetch_relay_states():
-    try:
-        r = requests.get(API_RELAY_URL, timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            print("Received relay state:", data)
-            set_relay_states(data)
-        else:
-            print("Server returned status:", r.status_code, " not changing outputs.")
-    except requests.RequestException as e:
-        print("Error contacting server:", e)
+def hysteresis_control(temp, start_on=4.5, stop_off=3.5, mode="auto"):
+    global _last_state_compressor, _last_change_compressor
 
-def get_mode():
-    try:
-        r = requests.get(API_MODE_URL, timeout=3)
-        return r.json().get("mode", "auto"), 0
-    except Exception:
-        print("Error fetching mode")
-        return "auto", 1
-
-_last_change_ms = 0
-_last_state = 0  # 0=off, 1=on
-
-def hysteresis_control(temp, start_on=4.5, stop_off=3.5):
-    global _last_change_ms, _last_state
     if temp is None:
         return None
     now_ms = _now_ms()
-    elapsed = (now_ms - _last_change_ms) / 1000.0
-    if _last_state == 1:
+    elapsed = (now_ms - _last_change_compressor) / 1000.0
+    if _last_state_compressor == 1:
         if temp < stop_off and elapsed >= MIN_ON_SEC:
-            _last_state = 0
-            _last_change_ms = now_ms
+            _last_state_compressor = 0
+            _last_change_compressor = now_ms
             return 0
     else:
         if temp > start_on and elapsed >= MIN_OFF_SEC:
-            _last_state = 1
-            _last_change_ms = now_ms
+            _last_state_compressor = 1
+            _last_change_compressor = now_ms
             return 1
     return None
 
-def post_relay_states(mode="auto"):
-    try:
-        relay_states = {relay: (1 if GPIO.input(pin) == 0 else 0) for relay, pin in RELAY_PINS.items()}
-        relay_states.update({'timestamp': _now_ms(), 'mode': mode})
-        r = requests.post(API_RELAY_URL, json=relay_states, timeout=3)
-        print("Synced relay states:", r.status_code, relay_states)
-        return 1
-    except Exception as e:
-        print("Failed to sync relay states:", e)
-        return 0
+def hysteresis_control_defrost(temp, start_on, stop_off):
+    global _last_state_defrost, _last_change_defrost
 
-def get_config():
-    try:
-        r = requests.get(API_CONFIG_URL, timeout=3)
-        if r.status_code == 200:
-            data = r.json()
-            ts = data.get("temp_start_compressor", 4.5)
-            tf = data.get("temp_stop_compressor", 3.5)
-            current_state['config']['temp_start_compressor'] = ts
-            current_state['config']['temp_stop_compressor'] = tf
-            return ts, tf
-    except requests.RequestException as e:
-        print("Error fetching config:", e)
-    return current_state['config']['temp_start_compressor'], current_state['config']['temp_stop_compressor']
+    if temp is None:
+        return None
+
+    now_ms = _now_ms()
+    elapsed = (now_ms - _last_change_defrost) / 1000.0
+
+    if _last_state_defrost == 1:
+        if temp > stop_off and elapsed >= MIN_ON_SEC:
+            _last_state_defrost = 0
+            _last_change_defrost = now_ms
+            return 0
+    else:
+        if temp < start_on and elapsed >= MIN_OFF_SEC:
+            _last_state_defrost = 1
+            _last_change_defrost = now_ms
+            return 1
+
+    return None
+
 
 def emergency():
     print("Emergency fail-safe: turning ALL relays OFF")
-    set_relay_states({"relay1": 0, "relay2": 0, "relay3": 0})
-
-def post_config_once():
-    try:
-        r = requests.post(API_CONFIG_URL, json=current_state['config'], timeout=3)
-        return r.ok
-    except requests.RequestException:
-        return False
+    set_relay_states({"compressor": 0, "ventilation": 0, "heater": 0})
 
 def read_ads():
     chan = AnalogIn(ads, ads1x15.Pin.A0)
@@ -290,68 +278,99 @@ def measure_rms(sample_time=1.0):
 
 
 def main():
-    global current_state
     print("Starting relay client...")
     setup_gpio()
 
     prev = load_state()
     if prev:
         # shallow merge: keep current keys if not present in file
-        current_state["mode"] = prev.get("mode", current_state["mode"])
-        current_state["relay_states"].update(prev.get("relay_states", {}))
-        current_state["config"].update(prev.get("config", {}))
+        current_state["target_temperature"] = prev.get("target_temperature", current_state["target_temperature"])
+        current_state["defrost_threshold_temperature"] = prev.get("defrost_threshold_temperature", current_state["defrost_threshold_temperature"])
+        current_state["status"] = prev.get("status", current_state["status"])
+        current_state["defrost_type"] = prev.get("defrost_type", current_state["defrost_type"])
 
-    last_mode_check = time.monotonic()
     last_upload = time.monotonic()
     last_save = time.monotonic()
-    last_handshake_try = 0.0
     last_measurements_read = 0
-    control_mode = 'auto'
-    first_connection = True
+    stable_sensor_reads = 0
+    STABLE_REQUIRED = 10
+    ever_connected = False
+    connection_fault_triggered = False
+    compressor_and_ventilation_forbidden = False
 
     try:
         while True:
             now_mono = time.monotonic()
-            w = read_scale()
+
+            # Reead sensors
             if now_mono - last_measurements_read > SENSOR_READ_INTERVAL:
-                temp_outside, hum, temp_inside, v = read_measurements()
+                temperature, humidity, evaporator_temperature, supply_voltage = read_measurements()
                 last_measurements_read = now_mono
+                print(f"temperature: {temperature}\thumidity: {humidity}\tevaporator_temperature:{evaporator_temperature}\tsupply_voltage: {supply_voltage}")
+                print(current_state)
 
-            # One-time config push on first (re)connection with backoff
-            if first_connection and (now_mono - last_handshake_try) >= MANUAL_ROUTE_BACKOFF:
-                if post_relay_states():
-                    first_connection = False
-                last_handshake_try = now_mono
+            # Check whether sensors work
+            if temperature is None or evaporator_temperature is None:
+                print("Temperature sensors do not work!")
+                emergency()
+                stable_sensor_reads = 0
+                current_state["problem"] = True
 
-            # Mode check
-            if (now_mono - last_mode_check) >= CHECK_POLL_INTERVAL:
-                control_mode, conn_err = get_mode()
-                last_mode_check = now_mono
-                if conn_err == 1 and first_connection == False:
-                    emergency()
-                    first_connection = True
-                print("Mode:", control_mode)
+                if (now_mono - last_upload) >= UPLOAD_INTERVAL:
+                    send_measurements(temperature, humidity, evaporator_temperature, supply_voltage)
+                    last_upload = now_mono
+                continue
 
-            # Control
-            if control_mode == "auto":
-                if first_connection == False:
-                    ts, tf = get_config()
-                    print(ts, tf)
-                else:
-                    ts = current_state["config"]["temp_start_compressor"]
-                    tf = current_state["config"]["temp_stop_compressor"]
-                change = hysteresis_control(temp_outside, ts, tf)
-                if change is not None:
-                    set_relay_states({"relay1": change})
-                    post_relay_states(mode="auto")
+            # If sensors work -> no problem
+            if current_state["problem"]:
+                stable_sensor_reads += 1
+                print(f"Sensor stable counter: {stable_sensor_reads}/{STABLE_REQUIRED}")
+                if stable_sensor_reads >= STABLE_REQUIRED:
+                    print("Sensors stable again - exiting fail-safe mode.")
+                    current_state["problem"] = False
+
+                if (now_mono - last_upload) >= UPLOAD_INTERVAL:
+                    send_measurements(temperature, humidity, evaporator_temperature, supply_voltage)
+                    last_upload = now_mono
+                continue
+
+            # Normal operation mode
+            if current_state["auto_mode"]:
+                    temperature_start_defrost = current_state["defrost_threshold_temperature"]
+                    temperature_stop_defrost = temperature_start_defrost + hysteresis_defrost
+                    change_defrost = hysteresis_control_defrost(evaporator_temperature, temperature_start_defrost, temperature_stop_defrost)
+                    if change_defrost is not None:
+                        if change_defrost == 1:
+                            compressor_and_ventilation_forbidden = True
+                            if current_state["defrost_type"] == "AUTO":
+                                set_relay_states({"compressor": 0, "ventilation": 0, "heater": 0})
+                            else:
+                                set_relay_states({"compressor": 0, "ventilation": 0, "heater": change_defrost})
+                        elif change_defrost == 0:
+                            compressor_and_ventilation_forbidden = False
+                            set_relay_states({"heater": 0})
+
+                    if not compressor_and_ventilation_forbidden:
+                        temperature_stop_compressor = current_state["target_temperature"]
+                        temperature_start_compressor = temperature_stop_compressor + hysteresis_compressor_stop
+                        change_compressor = hysteresis_control(temperature, temperature_start_compressor, temperature_stop_compressor)
+                        if change_compressor is not None:
+                            set_relay_states({"compressor": change_compressor})
+                            current_state["relay_states"]["compressor"] = change_compressor
             else:
-                fetch_relay_states()
+                relays = current_state["relay_states"]
+                set_relay_states({"compressor": relays["compressor"], "ventilation": relays["ventilation"], "heater": relays["heater"]})
 
             # Upload sensors
             if (now_mono - last_upload) >= UPLOAD_INTERVAL:
-                send_measurements(temp_inside, hum, temp_outside, v, w)
-                last_upload = now_mono
-
+                if send_measurements(temperature, humidity, evaporator_temperature, supply_voltage) == 0:
+                    last_upload = now_mono
+                    connection_fault_triggered = False
+                    ever_connected = True
+                else:
+                    if ever_connected and not connection_fault_triggered:
+                        emergency()
+                        connection_fault_triggered = True
             # Persist state
             if (now_mono - last_save) >= SAVE_STATE_INTERVAL:
                 save_state(current_state)
@@ -364,3 +383,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+	
